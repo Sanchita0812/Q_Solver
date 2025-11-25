@@ -9,9 +9,9 @@ from typing import Any, Dict, Optional
 def run_script(code: str) -> Dict[str, Any]:
     """
     Save `code` to a temp Python file, execute it in a subprocess,
-    and parse stdout as JSON.
+    and parse stdout as JSON if possible. If stdout is not JSON,
+    wrap it into a default error response.
     """
-   
     with tempfile.NamedTemporaryFile(
         suffix=".py", delete=False, mode="w", encoding="utf-8"
     ) as f:
@@ -33,7 +33,11 @@ def run_script(code: str) -> Dict[str, Any]:
             "returncode": -1,
             "stdout": "",
             "stderr": f"TimeoutExpired: {e}",
-            "response": None,
+            "response": {
+                "correct": False,
+                "url": None,
+                "reason": f"Script timeout: {e}",
+            },
         }
 
     stdout = proc.stdout.strip()
@@ -44,7 +48,19 @@ def run_script(code: str) -> Dict[str, Any]:
         try:
             parsed = json.loads(stdout)
         except json.JSONDecodeError:
-           parsed = None
+            # Wrap raw stdout into a structured error response
+            parsed = {
+                "correct": False,
+                "url": None,
+                "reason": stdout,
+            }
+    else:
+        # No stdout at all
+        parsed = {
+            "correct": False,
+            "url": None,
+            "reason": stderr or "Script produced no output",
+        }
 
     return {
         "returncode": proc.returncode,
