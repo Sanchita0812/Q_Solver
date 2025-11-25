@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+python-dotenv
+playwright
+beautifulsoup4
+lxml
+pandas
+numpy
+matplotlib
+pypdf
+networkx
