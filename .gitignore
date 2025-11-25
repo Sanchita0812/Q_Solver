@@ -1,0 +1,49 @@
+# --- Python basics ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Editor / OS cruft ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Playwright ---
+playwright-report/
+test-results/
+.playwright/
+
+# --- Coverage / testing ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Jupyter (if you ever use it) ---
+.ipynb_checkpoints/
+
+# --- Cache / misc ---
+.mypy_cache/
+.__pycache__/
+.cache/
