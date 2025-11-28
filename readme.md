@@ -69,8 +69,8 @@ Q\_solver/
 5.  **Configure Environment:**
     Create a `.env` file in the root directory:
     ```ini
-    # The secret you registered in the Google Form
-    EXPECTED_SECRET=qsolver
+    # The registered secret
+    EXPECTED_SECRET=your_secret
 
     # Your Google Gemini API Key
     GEMINI_API_KEY=your_actual_api_key_here
@@ -111,7 +111,7 @@ The application logs detailed progress to the console, including:
   * Script execution results (stdout/stderr).
   * Submission responses and next task URLs.
 
-## 🏗️ Architecture & Design Choices
+## Architecture & Design Choices
 
 1.  **The "Orchestrator" Pattern**:
     Instead of letting the LLM-generated script submit the answer directly (which is prone to network errors or credential leaks), the **Main Application (`solver.py`)** acts as the orchestrator. It extracts the answer from the script's `stdout` and performs the HTTP submission itself.
