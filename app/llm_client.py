@@ -1,16 +1,16 @@
 import os
-import json
 import time
+import json
 import httpx
 
-# Primary + fallback Gemini endpoints
-PRIMARY_ENDPOINT = (
+# Primary + fallback models
+GEMINI_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-1.5-pro:generateContent"
+    "models/gemini-2.5-flash:generateContent"
 )
 FALLBACK_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-2.5-flash:generateContent"
+    "models/gemini-1.5-pro:generateContent"
 )
 
 
@@ -27,10 +27,100 @@ def _get_gemini_api_key() -> str:
     """
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise GeminiConfigError(
-            "Missing GEMINI_API_KEY or GOOGLE_API_KEY in environment."
-        )
+        raise GeminiConfigError("Missing GEMINI_API_KEY or GOOGLE_API_KEY in environment.")
     return api_key
+
+
+def _call_gemini(endpoint: str, body: dict, api_key: str) -> dict:
+    """
+    Low-level wrapper with small retry logic.
+    """
+    headers = {
+        "Content-Type": "application/json",
+    }
+    url_with_key = f"{endpoint}?key={api_key}"
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url_with_key, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                return data
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            status = e.response.status_code
+            # Retry only on 5xx
+            if 500 <= status < 600 and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+        except httpx.RequestError as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+
+    # Should not reach here normally
+    raise RuntimeError(f"Failed to call Gemini after retries: {last_error}")
+
+
+def _extract_code_from_response(data: dict) -> str:
+    """
+    Extract the code text from the Gemini response.
+
+    Handles the standard generateContent shape:
+    {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {"text": "...python code..."}
+            ]
+          },
+          "finishReason": "...",
+          ...
+        }
+      ],
+      "usageMetadata": {...}
+    }
+    """
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: raw={data!r}")
+
+    first = candidates[0]
+    finish_reason = first.get("finishReason")
+    content = first.get("content", {}) or {}
+    parts = content.get("parts", []) or []
+
+    # Collect all text parts
+    text_chunks = []
+    for part in parts:
+        if isinstance(part, dict) and "text" in part:
+            text_chunks.append(part["text"])
+
+    if not text_chunks:
+        # If we hit MAX_TOKENS with zero visible text, surface a clear error
+        raise RuntimeError(
+            f"Gemini returned no text (finishReason={finish_reason}); raw={data!r}"
+        )
+
+    code = "\n".join(text_chunks).strip()
+
+    # Strip ``` fences if present
+    if code.startswith("```"):
+        # Remove leading ```
+        code = code.lstrip("`").lstrip()
+        if code.lower().startswith("python"):
+            code = code[6:].lstrip()
+        # Remove trailing ```
+        if code.endswith("```"):
+            code = code[:-3].rstrip()
+
+    return code.strip()
 
 
 def generate_solver_script(
@@ -43,225 +133,102 @@ def generate_solver_script(
     """
     Ask Gemini to generate a standalone Python script that:
 
-    - Uses only: httpx, pandas, numpy, matplotlib, pypdf, networkx, json, csv, base64, re,
-      plus the Python stdlib.
-    - Downloads / parses any referenced data (CSV, JSON, PDF, API, HTML) as required
-      by the quiz description.
-    - Computes the quiz ANSWER *programmatically* from the downloaded / parsed data.
-    - Prints ONLY a single line of JSON to stdout, e.g.:
-        {"answer": 12345, "trace": {...}}
-      where:
-        - "answer" is a scalar (number, string, or boolean), NOT a dict or list.
-        - "trace" is optional and may contain debug info for our logs.
-    - DOES NOT send the final POST to submit_url; the orchestrator handles submission.
-
-    The secret value is never to be printed, logged, or sent anywhere by the script.
+    - Uses httpx/pandas/numpy/etc. as needed to solve the quiz.
+    - Computes the quiz ANSWER.
+    - Prints ONLY a single line of JSON like: {"answer": ...}
+      via: print(json.dumps({"answer": ANSWER}))
+    - ANSWER must be a JSON-serialisable scalar (number/string/bool) or a
+      base64 string if a file/image is required.
+    - MUST NOT send the final POST to submit_url; that is done by the caller.
     """
 
     api_key = _get_gemini_api_key()
 
-    # Strong instruction block for Gemini
-    system_instruction = f"""
-You are an expert Python programmer. Your job is to write a Python 3 script
-that solves a data quiz. You MUST output ONLY valid Python code (no markdown,
-no explanations, no surrounding text).
+    # Keep the instruction short to reduce prompt tokens and avoid blowing
+    # the hidden "thoughts" budget.
+    # quiz_context is already truncated in solver; keep it short here too.
+    trimmed_context = quiz_context[:4000]
 
-Context:
-- quiz_url: {quiz_url}
-- submit_url (handled by caller, DO NOT POST HERE): {submit_url}
-- email: {email}
-- secret: (provided to the caller only; you MUST NOT print, log, or send it)
-
-The quiz description and any relevant text/HTML is:
-
-{quiz_context}
-
----------------------- REQUIREMENTS FOR THE GENERATED SCRIPT ----------------------
-
-1. Imports:
-   - You may use ONLY these third-party libraries:
-       httpx, pandas, numpy, matplotlib, pypdf, networkx, json, csv, base64, re
-     plus the Python standard library.
-   - Always import json, since you must print JSON at the end.
-
-2. Data access:
-   - To download any files or HTML mentioned in the quiz, use httpx with timeout=30.0.
-   - For CSV/TSV/etc:
-       - Use pandas.read_csv with robust options:
-         on_bad_lines='skip', engine='python' where appropriate.
-       - Convert columns to numeric with pandas.to_numeric(..., errors='coerce') as needed.
-   - For JSON:
-       - Use response.json() or json.loads(response.text).
-   - For PDF files:
-       - Use pypdf to read pages and extract text.
-   - For graph/network questions:
-       - Use networkx.
-   - For numeric/statistical work:
-       - Use numpy or the statistics module from stdlib.
-
-3. NO GUESSING:
-   - You MUST NOT guess or hard-code final numeric/boolean answers.
-   - The script MUST:
-       (a) Download and parse the actual data described in the quiz_context.
-       (b) Compute the answer from that data.
-   - If the quiz asks for "sum of a column":
-       - Load the data into pandas.
-       - Ensure the target column is numeric via to_numeric(..., errors='coerce').
-       - Drop NaNs and compute sum() on that column.
-   - If you cannot download or parse the data after reasonable attempts,
-     catch the exception and set answer = None and include an "error" string
-     in the JSON you print.
-
-4. Sanity checks:
-   - Before deciding on the final answer, perform simple checks:
-       - For sums, verify you aggregated at least 1 numeric value.
-       - For counts, verify that the filtered DataFrame is not empty.
-   - If a sanity check fails, set answer = None and include a brief error message.
-
-5. Output format (VERY IMPORTANT):
-   - At the end of the script, you MUST:
-       - Build a Python dict named result, for example:
-           result = {{
-               "answer": ANSWER,
-               "trace": {{
-                   "step": "description",
-                   "rows_processed": N,
-                   "file_url": "https://..."
-               }}
-           }}
-         where:
-           - "answer" is REQUIRED.
-           - "trace" is OPTIONAL and may contain any useful debug info.
-   - The value of result["answer"] MUST be one of:
-       - a number (int/float),
-       - a string,
-       - or a boolean.
-     It MUST NOT be a dict or list.
-   - If the quiz requires a file or image as the answer:
-       - Generate the file.
-       - Read it as bytes.
-       - Base64-encode it into a string.
-       - Use that base64 string as result["answer"].
-   - If an error occurs that prevents computing the answer, set:
-       - result["answer"] = None
-       - result["error"] = "<short explanation>"
-
-   - Finally, print EXACTLY one line to stdout:
-       import json
-       print(json.dumps(result))
-     No other print statements are allowed.
-
-6. Code structure:
-   - Put most logic into functions plus a main() function.
-   - Protect execution with:
-       if __name__ == "__main__":
-           main()
-
-7. Secrets and submission:
-   - You MUST NOT:
-       - POST to submit_url or any /submit endpoint.
-       - Include the secret value in any variable, string, or output.
-   - Your only responsibility is to compute and print the JSON described above.
-
-Remember:
-- Output MUST be plain Python code only (no ``` fences).
-- The script must be directly executable under Python 3.
-"""
+    prompt = (
+        "You are a Python code generator.\n"
+        "Write a COMPLETE Python 3 script (no comments outside code, no markdown) "
+        "that solves the data quiz described in the text below.\n\n"
+        "REQUIREMENTS:\n"
+        "1. The script may use these libraries if needed: httpx, json, csv, re, "
+        "   pandas, numpy, matplotlib, pypdf, networkx, base64.\n"
+        "2. Use httpx (timeout=30.0) for HTTP downloads. For CSV files, prefer "
+        "   pandas.read_csv with safe options (on_bad_lines='skip', engine='python').\n"
+        "3. Carefully read the quiz text to identify:\n"
+        "   - What needs to be computed (e.g., sum/mean, filtering, etc.).\n"
+        "   - Any file/URL you must download (CSV, JSON, PDF, etc.).\n"
+        "4. Compute the correct answer programmatically.\n"
+        "5. At the end of main(), build a dict:\n"
+        "       result = {\"answer\": ANSWER}\n"
+        "   where ANSWER is a scalar (number/string/bool), or a base64-encoded\n"
+        "   string if the answer is an image/file.\n"
+        "6. Print EXACTLY ONE line to stdout:\n"
+        "       import json\n"
+        "       print(json.dumps(result))\n"
+        "   No other prints or logging.\n"
+        "7. Do NOT send any HTTP POST to the quiz submit URL. Only compute locally.\n"
+        "8. Wrap everything in a main() function and guard with:\n"
+        "       if __name__ == '__main__':\n"
+        "           main()\n"
+        "9. On any exception, catch it and still print a JSON object with\n"
+        "   at least: {\"answer\": null, \"error\": \"...\"}.\n\n"
+        f"QUIZ PAGE URL: {quiz_url}\n"
+        f"(Submit URL is provided for reference only; do NOT POST to it: {submit_url})\n\n"
+        "QUIZ PAGE TEXT:\n"
+        f"{trimmed_context}\n"
+    )
 
     body = {
         "contents": [
             {
-                "parts": [
-                    {
-                        "text": system_instruction
-                    }
-                ]
+                "role": "user",
+                "parts": [{"text": prompt}],
             }
         ],
         "generationConfig": {
-            "temperature": 0.1,
+            # Low randomness, small output, no extra 'thinking' budget
+            "temperature": 0.0,
             "topP": 0.9,
             "topK": 40,
-            "maxOutputTokens": 8192,
+            "maxOutputTokens": 1024,
+            "responseMimeType": "text/plain",
+            # Try to minimise hidden reasoning tokens so we actually get code
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            },
         },
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
+    # 1) Try 2.5-flash
+    try:
+        data = _call_gemini(GEMINI_ENDPOINT, body, api_key)
+        code = _extract_code_from_response(data)
+        if code:
+            return code
+    except Exception as e:
+        # Log to stderr but fall through to fallback model
+        print(f"[generate_solver_script] 2.5-flash failed: {type(e).__name__}: {e}", flush=True)
 
-    # Simple retry with exponential backoff, switching endpoint if needed
-    last_error = None
-    for attempt in range(3):
-        try:
-            if attempt == 0:
-                endpoint = PRIMARY_ENDPOINT
-            elif attempt == 1:
-                endpoint = PRIMARY_ENDPOINT
-            else:
-                endpoint = FALLBACK_ENDPOINT
+    # 2) Fallback to 1.5-pro
+    try:
+        data = _call_gemini(FALLBACK_ENDPOINT, body, api_key)
+        code = _extract_code_from_response(data)
+        if code:
+            return code
+    except Exception as e:
+        print(f"[generate_solver_script] 1.5-pro fallback failed: {type(e).__name__}: {e}", flush=True)
 
-            url_with_key = f"{endpoint}?key={api_key}"
-
-            with httpx.Client(timeout=60.0) as client:
-                resp = client.post(url_with_key, headers=headers, json=body)
-                resp.raise_for_status()
-                data = resp.json()
-
-            # Extract text from Gemini response
-            try:
-                candidates = data["candidates"]
-                first = candidates[0]
-                parts = first["content"]["parts"]
-                code = parts[0]["text"]
-            except (KeyError, IndexError, TypeError) as e:
-                raise RuntimeError(f"Unexpected Gemini response format: {e}, raw={data!r}")
-
-            # Strip possible ```python fences
-            stripped = code.strip()
-            if stripped.startswith("```"):
-                # Remove starting fence
-                if stripped.lower().startswith("```python"):
-                    stripped = stripped[9:]
-                else:
-                    stripped = stripped[3:]
-                # Remove ending fence if present
-                if stripped.endswith("```"):
-                    stripped = stripped[:-3]
-                stripped = stripped.strip()
-
-            if not stripped:
-                raise RuntimeError("Empty code returned from Gemini")
-
-            return stripped
-
-        except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
-            last_error = e
-            # Retry on 5xx or network-ish issues; otherwise break
-            if isinstance(e, httpx.HTTPStatusError):
-                status = e.response.status_code
-                if 500 <= status < 600 and attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                else:
-                    break
-            else:
-                if attempt < 2:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                else:
-                    break
-
-    # Fallback script if Gemini fails completely
-    # This keeps the pipeline alive but returns a dummy answer.
-    fallback_code = '''import json
+    # 3) Ultimate fallback: trivial script so the pipeline doesn't crash
+    fallback_code = '''\
+import json
 
 def main():
-    result = {
-        "answer": None,
-        "error": "Failed to generate solver script from LLM."
-    }
+    # Fallback: no answer computed
+    result = {"answer": None, "error": "LLM generation failed"}
     print(json.dumps(result))
 
 if __name__ == "__main__":
