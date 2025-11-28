@@ -1,9 +1,9 @@
-import os
 import sys
 import json
 import tempfile
 import subprocess
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict
 
 
 def run_script(code: str) -> Dict[str, Any]:
@@ -11,20 +11,17 @@ def run_script(code: str) -> Dict[str, Any]:
     Save `code` to a temp Python file, execute it in a subprocess,
     and parse stdout as JSON if possible.
 
-    Guarantees:
-    - The returned dict has keys:
-        - returncode: int
-        - stdout: str
-        - stderr: str
-        - response: dict
-    - `response` will ALWAYS be a dict.
-    - If `response` has no 'answer' and no 'correct', we wrap it as:
-        {'answer': <original_response_dict>}
-      so that the caller can always find an 'answer' key.
+    Always returns a dict with keys:
+    - returncode: int
+    - stdout: str
+    - stderr: str
+    - response: dict with at least an 'answer' key (may be None)
     """
-    # Write the generated code to a temporary file
     with tempfile.NamedTemporaryFile(
-        suffix=".py", delete=False, mode="w", encoding="utf-8"
+        suffix=".py",
+        delete=False,
+        mode="w",
+        encoding="utf-8",
     ) as f:
         script_path = f.name
         f.write(code)
@@ -37,55 +34,73 @@ def run_script(code: str) -> Dict[str, Any]:
             capture_output=True,
             text=True,
             env=env,
-            timeout=90,
+            timeout=20,  # strict timeout for the generated script
         )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        returncode = proc.returncode
     except subprocess.TimeoutExpired as e:
-        # On timeout, return a structured error with answer=None
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"TimeoutExpired: {e}",
-            "response": {
-                "answer": None,
-                "error": f"Script timeout: {e}",
-            },
+        stdout = ""
+        stderr = f"TimeoutExpired: {e}"
+        returncode = -1
+        response = {
+            "answer": None,
+            "error": "Timeout",
         }
+        # Clean up file before returning
+        if os.path.exists(script_path):
+            os.remove(script_path)
+        return {
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "response": response,
+        }
+    except Exception as e:
+        stdout = ""
+        stderr = f"Script execution error: {e}"
+        returncode = -1
+        response = {
+            "answer": None,
+            "error": str(e),
+        }
+        if os.path.exists(script_path):
+            os.remove(script_path)
+        return {
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "response": response,
+        }
+    finally:
+        if os.path.exists(script_path):
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
 
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-
-    parsed: Optional[Any] = None
-
-    if stdout:
-        # Try to interpret stdout as JSON
-        try:
-            parsed = json.loads(stdout)
-        except json.JSONDecodeError:
-            # stdout wasn't valid JSON; treat it as an error message
+    # Try to parse stdout as JSON
+    try:
+        parsed = json.loads(stdout) if stdout else {}
+        # If script printed a bare scalar (number/string), wrap as answer
+        if not isinstance(parsed, dict):
+            parsed = {"answer": parsed}
+    except json.JSONDecodeError:
+        # If script printed plain text and exited cleanly, treat it as the answer
+        if returncode == 0 and stdout:
+            parsed = {"answer": stdout}
+        else:
             parsed = {
                 "answer": None,
-                "error": stdout,
+                "error": stderr or stdout or "Script produced no usable output",
             }
-    else:
-        # No stdout at all; treat stderr or a default message as error
-        parsed = {
-            "answer": None,
-            "error": stderr or "Script produced no output",
-        }
 
-    # At this point, `parsed` might not be a dict (e.g. a list or a raw value)
-    if not isinstance(parsed, dict):
-        parsed = {"answer": parsed}
-
-    # Key part:
-    # If the script's JSON has neither 'answer' nor 'correct',
-    # treat the entire object as the answer payload.
-    # This keeps 'correct' free for the "script already submitted" case.
-    if "answer" not in parsed and "correct" not in parsed:
-        parsed = {"answer": parsed}
+    # Ensure there is at least an 'answer' key in response
+    if "answer" not in parsed:
+        parsed["answer"] = None
 
     return {
-        "returncode": proc.returncode,
+        "returncode": returncode,
         "stdout": stdout,
         "stderr": stderr,
         "response": parsed,
