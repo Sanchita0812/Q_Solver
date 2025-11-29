@@ -97,7 +97,7 @@ curl -X POST "[http://127.0.0.1:8000/quiz](http://127.0.0.1:8000/quiz)" \
      -H "Content-Type: application/json" \
      -d '{
            "email": "your_email@example.com",
-           "secret": "qsolver",
+           "secret": "your_secret",
            "url": "[https://tds-llm-analysis.s-anand.net/demo](https://tds-llm-analysis.s-anand.net/demo)"
          }'
 ```
